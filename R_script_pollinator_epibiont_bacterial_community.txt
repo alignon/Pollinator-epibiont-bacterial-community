@@ -1,0 +1,782 @@
+# ============================================================
+# Pollinator 16S Pipeline with YEAR PROFILES 
+# Choose YEAR at the top; the script sets all year-specific fields
+# ============================================================
+
+## CHOOSE YEAR HERE (2022 or 2023)
+YEAR <- 2022  ## <-- SET to 2022 / 2023 
+
+## Profiles: year-specific settings (paths, metadata, controls, indices)
+profiles <- list(
+  `2022` = list(
+    project_dir        = "/path/to/2022/fastq",   ## <-- EDIT path to 2022 FASTQs
+    metadata_file      = "PollinatorData2022.tsv",
+    control_field      = "Treatment",
+    control_label      = "Control",
+    controls_to_remove = c(
+      "DNAnegative1","DNAnegative10","DNAnegative11","DNAnegative12",
+      "DNAnegative2","DNAnegative3","DNAnegative4","DNAnegative5",
+      "DNAnegative6","DNAnegative7","DNAnegative8","DNAnegative9",
+      "Negative2","Negative6"
+    ),
+    length_range       = 194:219,
+    pollinator_columns = 367:456,
+    treatment_recode   = c(BB = "Bumble bee", HB = "Honey bee", DF = "Drone fly"),
+    year_treatments    = c("Bumble bee", "Drone fly", "Honey bee"),
+    palette_year       = c("Bumble bee" = "#8DD3C7", "Drone fly" = "#E0E000", "Honey bee" = "#BEBADA"),
+    alpha_comparisons  = list(c("Bumble bee","Drone fly"), c("Bumble bee","Honey bee"), c("Honey bee","Drone fly"))
+  ),
+  `2023` = list(
+    project_dir        = "/path/to/2023/fastq",   ## <-- EDIT path to 2023 FASTQs
+    metadata_file      = "2023Pollinator.tsv",
+    control_field      = "Treatment",
+    control_label      = "Control",
+    controls_to_remove = c(
+      "2023DNAnegative2","2023DNAnegative4","2023DNAnegative5","2023DNAnegative6",
+      "2023Mock1","2023Mock2","2023Mock3","2023Mock4","2023Negative1","2023Negative2",
+      "2023Negative3","2023Negative4","2023Negative5"
+    ),
+    length_range       = 194:224,
+    pollinator_columns = c(1:4,84:125),
+    treatment_recode   = c(BB = "Bumble bee", LA = "Native bee"),
+    year_treatments    = c("Bumble bee", "Native bee"),
+    palette_year       = c("Bumble bee" = "#66C2A5", "Native bee" = "#E78AC3"),
+    alpha_comparisons  = list(c("Bumble bee","Native bee"))
+  )
+)
+
+## Load chosen profile and assign variables
+current <- profiles[[as.character(YEAR)]]
+project_dir        <- current$project_dir
+metadata_file      <- current$metadata_file
+control_field      <- current$control_field
+control_label      <- current$control_label
+controls_to_remove <- current$controls_to_remove
+length_range       <- current$length_range
+pollinator_columns <- current$pollinator_columns
+treatment_recode   <- current$treatment_recode
+year_treatments    <- current$year_treatments
+palette_year       <- current$palette_year
+alpha_comparisons  <- current$alpha_comparisons
+
+## TODO: SET THESE PATHS TO YOUR LOCAL SILVA DATABASE FILES
+SILVA_TRAIN_SET <- "/path/to/silva_nr_v138_train_set.fa.gz"  ## <-- EDIT THIS
+SILVA_SPECIES   <- "/path/to/silva_species_assignment_v138.fa.gz"  ## <-- EDIT THIS
+
+
+## Load all required R packages for sequence processing, statistics, and visualisation
+suppressPackageStartupMessages({
+  library(dada2)
+  library(phyloseq)
+  library(phangorn)
+  library(DECIPHER)
+  library(tidyr)
+  library(dplyr)
+  library(ggplot2)
+  library(vegan)
+  library(DESeq2)
+  library(metagenomeSeq)
+  library(microbiome)
+  library(ggpubr)
+  library(pairwiseAdonis)
+  library(RColorBrewer)
+  library(patchwork)
+  library(decontam)
+  library(tibble)
+})
+
+)
+### Amplicon sequence pre-processing DADA2 ###
+## Followed DADA2 Pipeline Tutorial (1.16) - https://benjjneb.github.io/dada2/tutorial.html ##
+## Set Working Directory and Define Input Paths
+setwd(project_dir)
+path <- project_dir
+list.files(path)
+
+
+## Define Forward and Reverse FASTQ Files
+fnFs <- sort(list.files(path, pattern = "_515f.forward.fastq.gz", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern = "_515f.reverse.fastq.gz", full.names = TRUE))
+
+# Extract sample names from the filenames
+sample.names <- sapply(strsplit(basename(fnFs), "__"), '[', 2)
+sample.names
+
+
+## Plot Quality Profiles - Visualize quality of forward and reverse reads for a subset of samples
+# Forward
+plotQualityProfile(fnFs[4:7])
+plotQualityProfile(fnFs[30:33])
+# Reverse
+plotQualityProfile(fnRs[4:7]) 
+plotQualityProfile(fnRs[30:33]) 
+
+
+## Create Filtered File Paths
+filtFs <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq.gz")) 
+filtRs <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+
+# Name the filtered object vectors with sample names
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+
+## Define Primer Sequences - Primer sequences used for trimming
+FWD <- "NNNNNNGTGYCAGCMGCCGCGGTAA"
+REV <- "NNNNNNGGACTACNVGGGTWTCTAAT"
+trimLeft <- c(FWD, REV)
+
+
+## Filter and Trim Reads
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen=c(200,220),
+                     maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=TRUE, 
+                     compress=TRUE, multithread=FALSE, trimLeft = c(25,26))
+head(out) 
+
+
+## Learn Error Models
+errF <- learnErrors(filtFs, multithread=TRUE)
+errR <- learnErrors(filtRs, multithread=TRUE)
+
+
+## Plot Error Rates - Visualise learned error models
+plotErrors(errF, nominalQ=TRUE)
+plotErrors(errR, nominalQ=TRUE)
+
+
+## Infer ASVs - Perform sample inference on forward and reverse reads separately
+dadaFs <- dada(filtFs, err=errF, multithread=TRUE)
+dadaRs <- dada(filtRs, err=errR, multithread=TRUE)
+
+# Inspect the dada objects produced above
+dadaFs[[1]]
+
+
+## Merge Paired Reads - Merge forward and reverse denoised reads
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose = TRUE)
+head(mergers[[1]])
+
+
+## Construct ASV Table and Filter by Length
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+
+table(nchar(getSequences(seqtab))) # ASV length distribution
+
+# Keep sequences within expected amplicon length range
+seq.tab.filtered <- seqtab[, nchar(colnames(seqtab)) %in% seq(length_range)]
+
+table(nchar(getSequences(seq.tab.filtered)))
+
+
+## Remove Chimeras
+seqtab.nochim <- removeBimeraDenovo(seq.tab.filtered, method="consensus", multithread=TRUE)
+dim(seqtab.nochim)
+sum(seqtab.nochim)/sum(seqtab)
+
+
+## Track Reads Through Pipeline
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab.nochim))
+
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+head(track)
+write.csv(track, "Sequencing Statistics - 16S.csv")
+
+
+## Assign Taxonomy
+taxa <- assignTaxonomy(seqtab.nochim, SILVA_TRAIN_SET, multithread=TRUE)
+
+# Attach taxonomic/species labels
+taxa <- addSpecies(taxa, SILVA_SPECIES)
+
+# Check your taxonomy assignment
+taxa.print <- taxa 
+rownames(taxa.print) <- NULL
+dim(taxa.print)
+
+
+## Export ASVs and Taxonomy
+# Assign ASV labels (ASV_1, ASV_2, ...)
+asv_seqs <- colnames(seqtab.nochim)
+asv_headers <- vector(dim(seqtab.nochim)[2], mode="character")
+for (i in 1:dim(seqtab.nochim)[2]) {
+  asv_headers[i] <- paste(">ASV", i, sep="_")
+}
+
+# Write FASTA of ASV sequences
+asv_fasta <- c(rbind(asv_headers, asv_seqs))
+write(asv_fasta, "ASVs.fa")
+
+# Write ASV count table
+asv_tab <- t(seqtab.nochim)
+row.names(asv_tab) <- sub(">", "", asv_headers)
+write.table(asv_tab, "ASVs_counts.tsv", sep="\t", quote=F, col.names=NA)
+
+# Write tax table with ASV names
+row.names(taxa.print) <- sub(">", "", asv_headers)
+write.table(taxa.print, "ASVs_named_correctly.tsv", sep="\t", quote=F, col.names=NA)
+
+
+## Phylogenetic Tree Construction
+sequences <- getSequences('ASVs.fa')
+alignment <- AlignSeqs(DNAStringSet(sequences), anchor=NA)
+
+# Convert alignment into phyDat format
+phang.align <- phyDat(as(alignment, "matrix"), type="DNA")
+
+# Compute maximum-likelihood distance matrix and build NJ tree
+dm <- dist.ml(phang.align) 
+treeNJ <- NJ(dm) 
+
+# Fit a basic phylogenetic model using GTR
+fit <- pml(treeNJ, data = phang.align) 
+fitGTR <- update(fit, k=4, inv=0.2)
+
+# Optimise GTR tree fit
+fitGTR <- optim.pml(fitGTR, model = "GTR", optInv = TRUE, optGamma = TRUE,
+                    rearrangement = "stochastic", control = pml.control(trace = 0))
+
+## Build a Phyloseq Object
+# Import Sample Metadata
+map.pollinator <- import_qiime_sample_data(pollinator_metadata_file)	## <-- Metadata file provided in github
+map.pollinator$Treatment <- recode(map.pollinator$Treatment, !!!treatment_recode)
+
+# Build phyloseq object
+ps.pollinator <- phyloseq(otu_table(asv_tab.pollinator, taxa_are_rows = TRUE),
+                          phyloseq::tax_table(taxa.print), phy_tree(fitGTR$tree))
+
+# Merge metadata into the phyloseq object
+ps.pollinator <- merge_phyloseq(ps.pollinator, map.pollinator)
+
+# Check your phyloseq object
+ps.pollinator
+sample_names(ps.pollinator)
+
+
+## Identify Contaminants (Using Controls)
+sample_data(ps.pollinator)$is.neg <- sample_data(ps.pollinator)[[control_field]] == control_label
+contamdf.prev <- isContaminant(ps.pollinator, method="prevalence", neg="is.neg", threshold=0.5)
+table(contamdf.prev$contaminant)
+
+head(which(contamdf.prev$contaminant))
+
+# Plot presence-absence patterns in positive vs negative samples 
+ps.pa <- transform_sample_counts(ps.pollinator, function(abund) 1*(abund>0))
+ps.pa.neg <- prune_samples(sample_data(ps.pa)[[control_field]] == control_label, ps.pa)
+ps.pa.pos <- prune_samples(sample_data(ps.pa)$Treatment %in% year_treatments, ps.pa)
+
+# Scatter plot showing contaminants
+df.pa <- data.frame(pa.pos=taxa_sums(ps.pa.pos), pa.neg=taxa_sums(ps.pa.neg),
+                    contaminant=contamdf.prev$contaminant)
+ggplot(data=df.pa, aes(x=pa.neg, y=pa.pos, color=contaminant)) + geom_point() +
+  xlab("Prevalence (Negative Controls)") + ylab("Prevalence (True Samples)")
+
+# Remove contaminant ASVs
+ps.pollinator <- prune_taxa(!contamdf.prev$contaminant, ps.pollinator)
+ps.pollinator
+
+
+## Remove Control Samples
+controls <- controls_to_remove
+
+# Prune these samples from the phyloseq object
+ps.pollinator <- prune_samples(!(sample_names(ps.pollinator) %in% controls), ps.pollinator)
+ps.pollinator
+
+
+## Filter Uncharacterized and Nuisance Taxa
+psa<- subset_taxa(ps.pollinator, !is.na(Phylum) & !Phylum %in% c("", "uncharacterized"))
+
+# Remove mitochondria, chloroplasts, cyanobacteria, etc.
+ps <- ps %>%
+  subset_taxa(Kingdom == "Bacteria" &
+                Family != "Mitochondria" &
+                Class != "Chloroplast" &
+                Phylum != "Cyanobacteria" &
+                Phylum != "Chloroplast" &
+                Phylum != "Chloroflexi")
+
+# Remove taxa with zero counts
+ps <- prune_taxa(taxa_sums(psy) > 0, psy)
+ps.a <- ps  # Rename cleaned object
+
+
+## Check Sequencing Coverage
+sample_sums(ps.a)
+write.csv(sample_sums(ps.a), "16S_Reads_Per_Sample-pollinator.csv")
+
+# Visualize library size distributions
+set.seed(711)
+level_order <- year_treatments
+DATA.p <- ps.a
+df.p <- as.data.frame(sample_data(DATA.p))
+df.p$LibrarySize <- sample_sums(DATA.p)
+df.p <- df.p[order(df.p$LibrarySize),]
+df.p$Index <- seq(nrow(df.p))
+
+# Plot ordered library size across 'Treatment' & coloured by 'replicate'
+ggplot(data=df.p, aes(x=Index, y=LibrarySize, colour=Repeat)) +
+  geom_point() +
+  facet_wrap(~ factor(Treatment)) +
+  scale_y_continuous(trans='sqrt')
+
+
+## Load and Edit Metadata 
+tax_tab.pollinator <- as.matrix(read.table("ASVs_named_correctly.tsv", header=T,
+                                           row.names=1, check.names=F, sep="\t"))
+sample_info_tab.pollinator <- read.table(metadata_file, header=T, row.names=1,
+                                         check.names=F, sep="\t")
+
+## TODO: Label each metadata column based on your metadata file structure
+## Example (uncomment and modify as needed):
+# sample_info_tab.pollinator$Treatment <- as.character(sample_info_tab.pollinator$V2)
+# Add more column assignments as needed for your specific metadata
+
+# Specify your count table
+count_tab.pollinator <- read.table("ASVs_counts.tsv", header=T, row.names=1,
+                                   check.names=F, sep="\t")
+count_tab.pollinator <- count_tab.pollinator[, pollinator_columns]
+
+
+## Rarefaction Curves
+rarecurve(t(count_tab.pollinator), step=100, col = 'blue', lwd=2, ylab="ASVs", label = FALSE) 
+
+# Add vertical line to where samples will be trimmed
+abline(v=100, col="red", lty=2)
+
+# Trim samples with less than 100 reads
+ps.a <- prune_samples(sample_sums(ps.a) >= 100, ps.a)
+ps.a
+
+
+## Compute prevalence of each feature
+prevdf.pollinator <- apply(X = otu_table(ps.a), 
+                           MARGIN = ifelse(taxa_are_rows(ps.a), yes = 1, no = 2), 
+                           FUN = function(x){sum(x > 0)})
+
+# Add taxonomy and total read counts
+prevdf.pollinator <- data.frame(Prevalence = prevdf.pollinator, 
+                                TotalAbundance = taxa_sums(ps.a),
+                                tax_table(ps.a))
+
+# Visualise prevalence of each phyla
+plyr::ddply(prevdf.pollinator, "Phylum", function(df1.p){
+  cbind(mean(df1.p$Prevalence), sum(df1.p$Prevalence))
+})
+
+
+## Exploring the taxonomic diversity
+table(phyloseq::tax_table(ps.a)[, "Phylum"])
+table(phyloseq::tax_table(ps.a)[, "Family"])
+table(phyloseq::tax_table(ps.a)[, "Genus"])
+
+
+## Normalize Using Cumulative Sum Scaling (CSS) 
+MGS.pollinator <- phyloseq_to_metagenomeSeq(ps.a)
+# Calculate the number of features for each sample
+num_features.pol <- colSums(MGS.pollinator@assayData$counts > 0)
+# Identify samples with one or zero features
+samples_to_remove.pol <- names(num_features.pol[num_features.pol <= 1])
+# Remove samples with one or zero features
+MGS.pollinator <- MGS.pollinator[, !(colnames(MGS.pollinator) %in% samples_to_remove.pol)]
+p <- cumNormStatFast(MGS.pollinator)
+p
+MGS.pollinator <- cumNorm(MGS.pollinator, p = p)
+# Extract the normalized counts
+normalized_counts.pol <- MRcounts(MGS.pollinator, norm = TRUE)
+# Create an OTU table from the normalized counts
+otu.pollinator <- otu_table(normalized_counts.pol, taxa_are_rows = TRUE)
+otu_table(ps.a) <- otu.pollinator
+ps.a
+
+
+## Transform to Relative Abundance
+ps_rel_abund.pol <- phyloseq::transform_sample_counts(ps.a, function(x){x / sum(x)})
+head(otu_table(ps_rel_abund.pol))
+
+
+## Root the Phylogeny
+set.seed(711)
+phy_tree(ps_rel_abund.pol) <- root(phy_tree(ps_rel_abund.pol), 
+                                    sample(taxa_names(ps_rel_abund.pol), 1), 
+                                    resolve.root=TRUE)
+is.rooted(phy_tree(ps_rel_abund.pol))
+
+
+## Alpha Diversity
+my_comparisons <- alpha_comparisons
+pollinator_colour <- palette_year
+
+plot_richness(ps_rel_abund.pol, x="Treatment", measures=c("Shannon")) +
+  geom_boxplot(aes(fill=Treatment)) + 
+  scale_fill_manual(values = pollinator_colour) + 
+  theme_bw() + 
+  ggtitle(paste0("Alpha diversity of ", YEAR, " pollinator wash samples")) + 
+  theme(panel.grid = element_blank(),
+        plot.title = element_text(hjust = 0.5),
+        strip.background = element_blank()) +
+  stat_compare_means(comparisons = my_comparisons, method = "t.test", label = "p.format") 	## <-- or label = "p.signif"
+
+# Remove columns with NA values in the OTU table
+clean_otu_table.pol <- otu_table(ps_rel_abund.pol)[, complete.cases(t(otu_table(ps_rel_abund.pol)))]
+
+# Convert the cleaned OTU table back to an OTU table object
+otu_table(ps_rel_abund.pol) <- otu_table(clean_otu_table.pol, taxa_are_rows=TRUE)
+
+
+## Beta Diversity (UniFrac NMDS)
+ord.nmds.uni <- ordinate(ps_rel_abund.pol, method="NMDS", distance="unifrac", weighted = TRUE)
+
+plot_ordination(ps_rel_abund.pol, ord.nmds.uni, color = "Treatment", 
+                title = paste0("Beta diversity of ", YEAR, " pollinator wash samples - UniFrac NMDS")) + 
+  geom_point(aes(color = Treatment), alpha = 0.5) + 
+  scale_color_manual(values = pollinator_colour) +  
+  stat_ellipse(aes(group = Treatment, fill = Treatment), type = "t", linetype = 2, 
+               geom="polygon", alpha=0.1) +
+  scale_fill_manual(values = pollinator_colour) +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        plot.title = element_text(hjust = 0.5))
+
+## Beta disperse
+betadisper <- betadisper(
+  phyloseq::distance(ps_rel_abund.pol, method = "bray"),
+  sample_data(ps_rel_abund.pol)$Treatment)
+
+anova(betadisper)  
+permutest(betadisper, permutations = 999)  
+
+plot(betadisper, col = pollinator_colour)
+boxplot(betadisper,
+        main = "Group Dispersion",
+        col = pollinator_colour,
+        xlab = "Pollinators")
+
+# Reorder data and have correct row numbers
+sample_info_tab.pollinator <- sample_info_tab.pollinator[colnames(asv_tab.pollinator), ]
+
+pol.diff <- setdiff(rownames(sample_info_tab.pollinator), colnames(clean_otu_table.pol))
+
+# Filter rows based on row names
+sample_info_tab.pol <- sample_info_tab.pollinator[!(rownames(sample_info_tab.pollinator) %in% pol.diff), ]
+
+
+## PERMANOVA and Pairwise PERMANOVA
+dist.matrix.pol <- phyloseq::distance(ps_rel_abund.pol, method = "bray")
+
+# Main PERMANOVA
+ps.perm.pol <- adonis2(dist.matrix.pol ~ sample_info_tab.pol$Treatment, data = sample_info_tab.pol)
+ps.perm.pol
+
+
+## Taxonomic Aggregation (Phylum)	## <-- EDIT and repeat or Family-level
+ps_phylum.pol <- tax_glom(ps_rel_abund.pol, "Phylum")
+phyloseq::taxa_names(ps_phylum.pol) <- phyloseq::tax_table(ps_phylum.pol)[, "Phylum"]
+phyloseq::otu_table(ps_phylum.pol)[1:5, 1:5]
+
+## Plot Phylum-Level Relative Abundances 	 ## <-- EDIT and repeat or Family-level
+phylum_pool <- psmelt(ps_phylum.pol) %>% 
+  group_by(OTU) %>%
+  summarize(pool = mean(Abundance) < 0.03, .groups = "drop")
+
+# Join pool info and replace low abundance phyla with "Other"
+phylum_summary <- psmelt(ps_phylum.pol) %>% 
+  inner_join(phylum_pool, by = "OTU") %>% 
+  mutate(OTU = if_else(pool, "Other", OTU),
+         Phylum = if_else(pool, "Other", Phylum),
+         Phylum_label = if_else(Phylum == "Other", "Other", paste0("italic('", Phylum, "')"))
+  ) %>% 
+  group_by(Treatment, OTU, Sample, Phylum, Phylum_label) %>% 
+  summarize(Abundance = sum(Abundance), .groups = "drop")
+
+# Plot
+ggplot(phylum_summary, aes(x = Sample, y = Abundance, fill = Phylum_label)) +
+  geom_col(width = 1, color = NA) +
+  facet_wrap(~Treatment, scales = "free_x") +
+  labs(x = "", y = "Relative Abundance\n", fill = "Phylum") +
+  theme(panel.background = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())
+
+## Taxonomic Aggregation (Genus)	
+ps_genus.pol <- tax_glom(ps_rel_abund.pol, "Genus")
+phyloseq::taxa_names(ps_genus.pol) <- phyloseq::tax_table(ps_geus.pol)[, "Genus"]
+phyloseq::otu_table(ps_genus.pol)[1:5, 1:5]
+
+## Plot Genus-Level Relative Abundances
+genus_pool <- psmelt(ps_genus.pol) %>% 
+  group_by(OTU) %>%
+  summarize(pool = mean(Abundance) < 0.03, .groups = "drop")
+
+# Join pool info and replace low abundance phyla with "Other"
+genus_summary <- psmelt(ps_genus.pol) %>%
+  left_join(genus_pool, by = c("OTU", "Treatment")) %>%
+  mutate(
+    pool = if_else(is.na(pool), TRUE, pool),
+    OTU = if_else(pool, "Other", OTU),
+    Genus = if_else(pool, "Other", Genus),
+    Genus_label = if_else(Genus == "Other", "Other", paste0("italic('", Genus, "')"))
+  ) %>%
+  group_by(Treatment, OTU, sample_Sample, Genus, Genus_label) %>%
+  summarize(Abundance = sum(Abundance), .groups = "drop") %>%
+  group_by(Treatment) %>%
+  mutate(Abundance = 100 * Abundance / sum(Abundance)) %>%
+  ungroup()
+
+# Define colours for each genus (for consistent plotting)
+genus_colours <- c(
+  Acinetobacter = "#BEBADA", 
+  Aquabacterium = "#FFFFB3", 
+  Carnimonas = "#B3CDE3",
+  Caulobacter = "#CCEBC5", 
+  Chryseobacterium= "#FFB347",
+  Enhydrobacter = "#D9D9D9",   
+  Gilliamella = "#FCCDE5",
+  Hydrogenophilus= "#DDB892",
+  Lactobacillus = "#FB9A99",
+  Meithormus = "#BC80BD",  
+  Norcardioides = "#FFED6F",
+  Ottowia = "#80B1D3",
+  Paracoccus = "#B3DE69",
+  Pseudomonas = "#FDBF6F",
+  Schlegelella = "#F781BF",
+  Snodgrassella = "#B15928",
+  Sphingomonas = "#E31A1C",
+  Spirosoma = "#6A3D9A",
+  Streptococcus = "#D5B60A",
+  Tepidimonas = "#1F78B4",
+  Other = "darkgrey")
+
+genus_colour_labelled <- c(
+  setNames(
+    genus_colour_p[names(genus_colour_p) != "Other"],
+    paste0("italic('", names(genus_colour_p)[names(genus_colour_p) != "Other"], "')")
+  ),
+  Other = "darkgrey"
+)
+
+# Plot 
+ggplot(genus_summary, 
+             aes(x = Treatment, y = Abundance, fill = Genus_label)) +
+  geom_col(width = 1, colour = NA, linewidth = 0) +
+  facet_wrap(~Treatment, scales = "free_x", strip.position = "bottom") +
+  labs(x = "", y = "Relative Abundance (%)", fill = "Genus") +
+  scale_fill_manual(values = genus_colour_labelled,
+    labels = function(x) parse(text = x)) +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    legend.key = element_rect(colour = NA))
+
+
+## Upset Plot
+library(MicrobiotaProcess)
+library(UpSetR)
+
+upset_colour <- palette_year 	# Uses colour palette from the year profile, just make sure they are in the correct order to match set size order
+
+upsetda <- get_upset(obj=ps_genus.pol, factorNames="Treatment")
+upset(upsetda, sets=unique(as.vector(sample_data(ps_genus.pol)$Treatment)),
+      order.by = "freq", sets.bar.color = upset_colour, text.scale = 2)
+
+
+## DESEQ2 - Cycles through all pairwise treatment combinations for the chosen year
+## NOTE: ps.2 must be your raw counts phyloseq object (before CSS normalisation)
+
+deseq_results_list <- list()  # Store all results
+
+for (combo in alpha_comparisons) {
+  
+  grp1 <- combo[1]
+  grp2 <- combo[2]
+  label <- paste0(gsub(" ", "_", grp1), "_vs_", gsub(" ", "_", grp2))
+  message("\n========================================")
+  message("Running DESeq2: ", grp1, " vs ", grp2)
+  message("========================================")
+  
+  # Subset to the two treatments
+  ps.sub <- subset_samples(ps.2, Treatment %in% c(grp1, grp2))
+  ps.sub <- prune_taxa(taxa_sums(ps.sub) > 0, ps.sub)
+  
+  # Make Treatment a factor with grp2 as reference (positive LFC = grp1 enriched)
+  sample_data(ps.sub)$Treatment <- factor(
+    sample_data(ps.sub)$Treatment,
+    levels = c(grp2, grp1)
+  )
+  
+  # Run DESeq2
+  dds <- phyloseq_to_deseq2(ps.sub, ~ Treatment)
+  dds <- DESeq(dds, sfType = "poscounts")
+  
+  # Extract results
+  res <- results(dds)
+  res <- res[order(res$padj, na.last = NA), ]
+  
+  # Print full results for this comparison
+  message("\n--- Full DESeq2 results (", grp1, " vs ", grp2, ") ---")
+  print(res)
+  
+  alpha <- 0.01
+  sigtab <- res[!is.na(res$padj) & res$padj < alpha, ]
+  
+  if (nrow(sigtab) == 0) {
+    message("  No significant taxa (padj < 0.01) for: ", label)
+    next
+  }
+  
+  sigtab <- cbind(
+    as(sigtab, "data.frame"),
+    as(tax_table(ps.sub)[rownames(sigtab), ], "matrix")
+  )
+  
+  sigtab$ASV <- rownames(sigtab)
+  
+  # Print significant results summary for this comparison
+  message("\n--- Significant taxa (padj < 0.01): ", nrow(sigtab), " ---")
+  print(sigtab)
+  
+  deseq_results_list[[label]] <- sigtab  # Save for later use
+  
+  # --- Plotting ---
+  sigtabgen <- subset(sigtab, !is.na(Family))
+  
+  if (nrow(sigtabgen) == 0) {
+    message("  No taxa with Family annotation to plot for: ", label)
+    next
+  }
+  
+  # Order by Phylum then Genus
+  x <- tapply(sigtabgen$log2FoldChange, sigtabgen$Phylum, max)
+  sigtabgen$Phylum <- factor(as.character(sigtabgen$Phylum), levels = names(sort(x, TRUE)))
+  
+  x <- tapply(sigtabgen$log2FoldChange, sigtabgen$Genus, max)
+  sigtabgen$Genus <- factor(as.character(sigtabgen$Genus), levels = names(sort(x, TRUE)))
+  
+  max_lfc <- max(abs(sigtabgen$log2FoldChange), na.rm = TRUE)
+  
+  # Direction label: positive LFC = grp1, negative LFC = grp2
+  sigtabgen$Direction <- ifelse(sigtabgen$log2FoldChange > 0, grp1, grp2)
+  
+  # Colour: only the two relevant treatments from the year palette
+  combo_colour <- pollinator_colour[c(grp2, grp1)]
+  
+  # Plot: Genus + ASV ID
+  sigtabgen$Genus_ASV <- paste0(sigtabgen$Genus, "\n", sigtabgen$ASV)
+  sigtabgen$Genus_ASV <- factor(
+    sigtabgen$Genus_ASV,
+    levels = sigtabgen$Genus_ASV[order(sigtabgen$log2FoldChange)]
+  )
+  
+  p2 <- ggplot(sigtabgen, aes(y = Genus_ASV, x = log2FoldChange, fill = Direction)) +
+    geom_vline(xintercept = 0, color = "darkgray", linewidth = 0.5) +
+    geom_col() +
+    scale_fill_manual(values = combo_colour) +
+    scale_x_continuous(limits = c(-max_lfc, max_lfc)) +
+    theme_bw() +
+    theme(axis.text.y = element_text(face = "italic", lineheight = 0.9)) +
+    labs(
+      title = paste0("DESeq2: ", grp1, " vs ", grp2, " (", YEAR, ")"),
+      x = paste0("\u2190 ", grp2, " | log2FC | ", grp1, " \u2192"),
+      y = "Genus (ASV ID)",
+      fill = ""
+    )
+  print(p2)
+  
+  message("\n--- Completed: ", grp1, " vs ", grp2, " ---\n")
+  
+}
+
+# Summary: list all comparisons with significant results
+message("\n========================================")
+message("DESeq2 complete. Comparisons with significant taxa:")
+print(names(deseq_results_list))
+message("========================================")
+
+
+## GENUS OTU FREQUENCY TABLE
+## Identifies how frequently each genus appears across samples (presence/absence)
+## and flags whether each genus is gut-associated or environmental
+
+# Extract OTU table (samples x OTUs)
+otu <- as(otu_table(ps_rel_abund.pol), "matrix")
+if (taxa_are_rows(ps_rel_abund.pol)) otu <- t(otu)
+
+# Presence / absence
+otu_pa <- otu > 0
+
+# Taxonomy
+tax <- as(tax_table(ps_rel_abund.pol), "matrix")
+
+# Extract sample metadata
+meta <- data.frame(sample_data(ps_rel_abund.pol))
+if (!"Sample" %in% colnames(meta)) {
+  meta$Sample <- rownames(meta)
+}
+
+# Long format + add Genus + Treatment
+df <- as.data.frame(otu_pa) |>
+  rownames_to_column("Sample") |>
+  pivot_longer(-Sample, names_to = "OTU", values_to = "Present") |>
+  left_join(
+    data.frame(OTU = rownames(tax), Genus = tax[, "Genus"]),
+    by = "OTU"
+  ) |>
+  left_join(
+    meta[, c("Sample", "Treatment")],
+    by = "Sample"
+  )
+
+# Frequency by genus
+genus_frequency <- df |>
+  filter(Present, !is.na(Genus)) |>
+  group_by(Genus) |>
+  summarise(
+    n_samples = n(),
+    Treatments_found_in = paste(sort(unique(Treatment)), collapse = ", "),
+    n_treatments = n_distinct(Treatment),
+    .groups = "drop"
+  )
+print(genus_frequency)
+
+# Define gut-associated genera of interest
+specific_genera.pol <- c(
+  "Acinetobacter", "Apibacter", "Apilactobacillus", "Arsenophonus",
+  "Bartonella", "Bifidobacterium", "Bombella", "Bombilactobacillus",
+  "Bombiscardovia", "Commensalibacter", "Frischella", "Gilliamella",
+  "Lactobacillus", "Lysinibacillus", "Melissococcus", "Paenibacillus",
+  "Parasaccharibacter", "Schmidhempelia", "Serratia", "Snodgrassella",
+  "Spiroplasma", "Caulobacter", "Escherichia", "Pseudomonas",
+  "Staphylococcus"
+)
+
+# Top 51 genera by sample frequency
+top51_genus <- genus_frequency |>
+  filter(!is.na(Genus)) |>
+  arrange(desc(n_samples)) |>
+  slice_head(n = 51)
+
+# Flag gut-associated vs environmental
+top51_genus <- top51_genus |>
+  mutate(
+    Association = if_else(
+      Genus %in% specific_genera.pol,
+      "Gut-associated",
+      "Environmental"
+    )
+  )
+
+# Rename for export
+worksheet_top51 <- top51_genus |>
+  rename(OTU_sample_frequency = n_samples)
+
+print(worksheet_top51)
+
+# Export to CSV (filename uses YEAR variable so it updates automatically)
+write.csv(
+  worksheet_top51,
+  file = paste0("Top51_Genus_OTU_Frequency_Gut_vs_Environmental_", YEAR, ".csv"),
+  row.names = FALSE
+)
+message("Exported: Top51_Genus_OTU_Frequency_Gut_vs_Environmental_", YEAR, ".csv")
+
