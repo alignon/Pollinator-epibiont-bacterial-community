@@ -1,8 +1,6 @@
-# Pollinator-epibiont-bacterial-community
+# Manuscript title: Pollinator species identity and habitat determine epibiont bacterial diversity  
 
 **Submitted to Microbial Ecology**
-
-**Manuscript title:** Pollinator species identity and habitat determine epibiont bacterial diversity  
 
 **Authors:** 
 - V. Aiko Lignon
