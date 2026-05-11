@@ -6,9 +6,9 @@
 
 **Authors:** 
 - V. Aiko Lignon
-- E. Eirian Jones,
-- Manpreet K. Dhami,
-- Clive Kaiser,
+- E. Eirian Jones
+- Manpreet K. Dhami
+- Clive Kaiser
 - Flore Mas
 
 **Affiliations:** Lincoln University, Lincoln, New Zealand; Bioeconomy Science Institute - Manaaki Whenua Landcare Research, Lincoln, New Zealand; Bioeconomy Science Institute - Plant & Food Research, Lincoln, New Zealand  
