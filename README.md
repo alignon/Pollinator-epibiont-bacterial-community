@@ -25,3 +25,4 @@ NOTE: Samples were sequenced across different Illumina sequencing runs and were 
 R Script: 
 - R_script_pollinator_epibiont_bacterial_community.txt
 
+It includes the pipeline to process 16S rRNA gene amplicons, build `phyloseq` objects, perform community analyses (alpha/beta diversity, beta dispersion, PERMANOVA), identify shared/unique genera (UpSet), and conduct differential abundance testing (DESeq2).
